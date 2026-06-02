@@ -18,6 +18,7 @@ import pyroki_snippets as pks
 
 
 TARGET_LINK_NAME = "link_tcp"
+XARM_ARM_WARMSTART_DEG = np.array([0.0, -45.0, 0.0, 35.0, 0.0, 65.0, 90.0])
 
 
 def load_xarm_urdf(robot_urdf_path: Path) -> yourdfpy.URDF:
@@ -28,6 +29,14 @@ def load_xarm_urdf(robot_urdf_path: Path) -> yourdfpy.URDF:
         return yourdfpy.filename_handler_magic(fname, dir=base_path)
 
     return yourdfpy.URDF.load(robot_urdf_path, filename_handler=filename_handler)
+
+
+def xarm_default_cfg(urdf: yourdfpy.URDF) -> np.ndarray:
+    """Return xArm default config with the requested arm posture."""
+    default_robot = pk.Robot.from_urdf(urdf)
+    default_cfg = np.array(default_robot.joint_var_cls.default_factory())
+    default_cfg[:7] = np.deg2rad(XARM_ARM_WARMSTART_DEG)
+    return default_cfg
 
 
 def main():
@@ -42,7 +51,7 @@ def main():
             "Expected xArm assets at `examples/retarget_helpers/hand/xarm`."
         ) from exc
 
-    robot = pk.Robot.from_urdf(urdf)
+    robot = pk.Robot.from_urdf(urdf, default_joint_cfg=xarm_default_cfg(urdf))
     robot_coll = RobotCollision.from_urdf(urdf)
 
     if TARGET_LINK_NAME not in robot.links.names:
@@ -87,8 +96,8 @@ def main():
     timing_handle = server.gui.add_number("Elapsed (ms)", 0.001, disabled=True)
 
     sol_pos, sol_wxyz = None, None
-    sol_traj = np.array(
-        robot.joint_var_cls.default_factory()[None].repeat(len_traj, axis=0)
+    sol_traj = np.array(robot.joint_var_cls.default_factory())[None].repeat(
+        len_traj, axis=0
     )
     while True:
         start_time = time.time()
