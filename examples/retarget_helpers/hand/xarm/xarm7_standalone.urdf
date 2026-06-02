@@ -532,6 +532,12 @@
     <limit effort="50" lower="0" upper="0.85" velocity="2"/>
     <mimic joint="drive_joint" multiplier="1" offset="0"/>
   </joint>
+  <link name="left_tip"/>
+  <joint name="left_tip_joint" type="fixed">
+    <origin rpy="0 0 0" xyz="0 -0.026 0.061"/>
+    <parent link="left_finger"/>
+    <child link="left_tip"/>
+  </joint>
   <link name="left_inner_knuckle">
     <inertial>
       <origin rpy="0 0 0" xyz="1.86600784687907E-06 0.0220467847633621 0.0261334672830885"/>
@@ -615,6 +621,12 @@
     <axis xyz="1 0 0"/>
     <limit effort="50" lower="0" upper="0.85" velocity="2"/>
     <mimic joint="drive_joint" multiplier="1" offset="0"/>
+  </joint>
+  <link name="right_tip"/>
+  <joint name="right_tip_joint" type="fixed">
+    <origin rpy="0 0 0" xyz="0 0.026 0.061"/>
+    <parent link="right_finger"/>
+    <child link="right_tip"/>
   </joint>
   <link name="right_inner_knuckle">
     <inertial>
