@@ -10,11 +10,14 @@ def create_conn_tree(robot: pk.Robot, link_indices: jnp.ndarray) -> jnp.ndarray:
     """
     n = len(link_indices)
     conn_matrix = jnp.zeros((n, n))
+    joint_indices = jnp.array(
+        [robot.links.parent_joint_indices[int(link_idx)] for link_idx in link_indices]
+    )
 
     def is_direct_chain_connection(idx1: int, idx2: int) -> bool:
-        """Check if two joints are connected in the kinematic chain without other retargeted joints between"""
-        joint1 = link_indices[idx1]
-        joint2 = link_indices[idx2]
+        """Check if links are directly connected without another retargeted link between."""
+        joint1 = joint_indices[idx1]
+        joint2 = joint_indices[idx2]
 
         # Check path from joint2 up to root
         current = joint2
@@ -22,7 +25,7 @@ def create_conn_tree(robot: pk.Robot, link_indices: jnp.ndarray) -> jnp.ndarray:
             parent = robot.joints.parent_indices[current]
             if parent == joint1:
                 return True
-            if parent in link_indices:
+            if parent in joint_indices:
                 # Hit another retargeted joint before finding joint1
                 break
             current = parent
@@ -33,7 +36,7 @@ def create_conn_tree(robot: pk.Robot, link_indices: jnp.ndarray) -> jnp.ndarray:
             parent = robot.joints.parent_indices[current]
             if parent == joint2:
                 return True
-            if parent in link_indices:
+            if parent in joint_indices:
                 # Hit another retargeted joint before finding joint2
                 break
             current = parent
