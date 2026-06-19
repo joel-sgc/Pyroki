@@ -10,6 +10,7 @@ import time
 from pathlib import Path
 from typing import Tuple, TypedDict
 
+import zmq
 import jax
 import jax.numpy as jnp
 import jax_dataclasses as jdc
@@ -19,17 +20,15 @@ import numpy as onp
 import pyroki as pk
 import trimesh
 import viser
-import zmq
 import yourdfpy
 from scipy.spatial.transform import Rotation as R
 from viser.extras import ViserUrdf
+from zmq_utils import ZMQSubscriber, ZMQPublisher
 
 from retarget_helpers._utils import create_conn_tree
 
-context = zmq.Context()
-socket = context.socket(zmq.PUB)
-socket.connect("tcp://localhost:5555")
-socket.setsockopt_string(zmq.SUBSCRIBE, "")
+subscriber = ZMQSubscriber(host="localhost", port=5052, topic="ruka_r_keypoints")
+publisher = ZMQPublisher(host="localhost", port=5053)
 
 MANO_TO_RUKA_MAPPING = {
     # Wrist / palm.
@@ -67,10 +66,6 @@ class RetargetingWeights(TypedDict):
     """Local alignment weight, by matching relative keypoint/link vectors."""
     global_alignment: float
     """Global alignment weight, by matching keypoint positions to robot links."""
-    joint_smoothness: float
-    """Joint smoothness weight."""
-    root_smoothness: float
-    """Root translation smoothness weight."""
 
 
 def load_ruka_urdf(robot_urdf_path: Path) -> yourdfpy.URDF:
@@ -98,7 +93,7 @@ def get_mapping_from_mano_to_ruka(robot: pk.Robot) -> tuple[jnp.ndarray, jnp.nda
     return jnp.array(ruka_link_indices), jnp.array(mano_joint_indices)
 
 
-def main():
+def old_main():
     """Main function for RUKA hand retargeting."""
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -148,9 +143,6 @@ def main():
         for mano_idx, link_idx in zip(mano_joint_idx, ruka_link_idx):
             print(f"  {int(mano_idx):02d}: {robot.links.names[int(link_idx)]}")
         return
-
-    # HERE COMES THE RUKA DATA
-    
 
     keypoints = dexycb_motion_data["world_hand_joints"]
     assert not onp.isnan(keypoints).any()
@@ -282,44 +274,33 @@ def solve_retargeting(
     mano_joint_retarget_indices: jnp.ndarray,
     mano_mask: jnp.ndarray,
     weights: RetargetingWeights,
+    prev_joints: jnp.ndarray,
+    prev_T_world_root: jaxlie.SE3,
 ) -> Tuple[jaxlie.SE3, jnp.ndarray]:
-    """Solve the retargeting problem."""
-    n_retarget = len(mano_joint_retarget_indices)
-    timesteps = target_keypoints.shape[0]
-
-    class ManoJointsScaleVar(
-        jaxls.Var[jax.Array], default_factory=lambda: jnp.ones((n_retarget, n_retarget))
-    ): ...
-
-    class OffsetVar(jaxls.Var[jax.Array], default_factory=lambda: jnp.zeros((3,))): ...
-
-    var_joints = robot.joint_var_cls(jnp.arange(timesteps))
-    var_Ts_world_root = jaxls.SE3Var(jnp.arange(timesteps))
-    var_mano_joints_scale = ManoJointsScaleVar(jnp.zeros(timesteps))
-    var_offset = OffsetVar(jnp.zeros(timesteps))
+    """Solve single-frame retargeting with warm start."""
+    var_joints = robot.joint_var_cls(0)
+    var_T_world_root = jaxls.SE3Var(0)
 
     @jaxls.Cost.factory
     def retargeting_cost(
         var_values: jaxls.VarValues,
-        var_Ts_world_root: jaxls.SE3Var,
+        var_T_world_root: jaxls.SE3Var,
         var_robot_cfg: jaxls.Var[jnp.ndarray],
-        var_mano_joints_scale: ManoJointsScaleVar,
         keypoints: jnp.ndarray,
     ) -> jax.Array:
         robot_cfg = var_values[var_robot_cfg]
         T_root_link = jaxlie.SE3(robot.forward_kinematics(cfg=robot_cfg))
-        T_world_root = var_values[var_Ts_world_root]
+        T_world_root = var_values[var_T_world_root]
         T_world_link = T_world_root @ T_root_link
 
-        mano_pos = keypoints[jnp.array(mano_joint_retarget_indices)]
-        robot_pos = T_world_link.translation()[jnp.array(ruka_link_retarget_indices)]
+        mano_pos = keypoints[mano_joint_retarget_indices]
+        robot_pos = T_world_link.translation()[ruka_link_retarget_indices]
 
         delta_mano = mano_pos[:, None] - mano_pos[None, :]
         delta_robot = robot_pos[:, None] - robot_pos[None, :]
 
-        position_scale = var_values[var_mano_joints_scale][..., None]
         residual_position_delta = (
-            (delta_mano - delta_robot * position_scale)
+            (delta_mano - delta_robot)
             * (1 - jnp.eye(delta_mano.shape[0])[..., None])
             * mano_mask[..., None]
         )
@@ -330,21 +311,15 @@ def solve_retargeting(
         delta_robot_normalized = delta_robot / jnp.linalg.norm(
             delta_robot + 1e-6, axis=-1, keepdims=True
         )
-        residual_angle_delta = 1 - (delta_mano_normalized * delta_robot_normalized).sum(
-            axis=-1
-        )
         residual_angle_delta = (
-            residual_angle_delta
-            * (1 - jnp.eye(residual_angle_delta.shape[0]))
+            (1 - (delta_mano_normalized * delta_robot_normalized).sum(axis=-1))
+            * (1 - jnp.eye(delta_mano.shape[0]))
             * mano_mask
         )
 
         return (
             jnp.concatenate(
-                [
-                    residual_position_delta.flatten(),
-                    residual_angle_delta.flatten(),
-                ],
+                [residual_position_delta.flatten(), residual_angle_delta.flatten()],
                 axis=0,
             )
             * weights["local_alignment"]
@@ -353,11 +328,11 @@ def solve_retargeting(
     @jaxls.Cost.factory
     def pc_alignment_cost(
         var_values: jaxls.VarValues,
-        var_Ts_world_root: jaxls.SE3Var,
+        var_T_world_root: jaxls.SE3Var,
         var_robot_cfg: jaxls.Var[jnp.ndarray],
         keypoints: jnp.ndarray,
     ) -> jax.Array:
-        T_world_root = var_values[var_Ts_world_root]
+        T_world_root = var_values[var_T_world_root]
         robot_cfg = var_values[var_robot_cfg]
         T_root_link = jaxlie.SE3(robot.forward_kinematics(cfg=robot_cfg))
         T_world_link = T_world_root @ T_root_link
@@ -365,62 +340,92 @@ def solve_retargeting(
         keypoint_pos = keypoints[mano_joint_retarget_indices]
         return (link_pos - keypoint_pos).flatten() * weights["global_alignment"]
 
-    @jaxls.Cost.factory
-    def root_smoothness(
-        var_values: jaxls.VarValues,
-        var_Ts_world_root: jaxls.SE3Var,
-        var_Ts_world_root_prev: jaxls.SE3Var,
-    ) -> jax.Array:
-        return (
-            var_values[var_Ts_world_root].translation()
-            - var_values[var_Ts_world_root_prev].translation()
-        ).flatten() * weights["root_smoothness"]
-
     costs = [
-        retargeting_cost(
-            var_Ts_world_root,
-            var_joints,
-            var_mano_joints_scale,
-            target_keypoints,
-        ),
-        pk.costs.smoothness_cost(
-            robot.joint_var_cls(jnp.arange(1, timesteps)),
-            robot.joint_var_cls(jnp.arange(0, timesteps - 1)),
-            jnp.array([weights["joint_smoothness"]]),
-        ),
-        pc_alignment_cost(
-            var_Ts_world_root,
-            var_joints,
-            target_keypoints,
-        ),
-        root_smoothness(
-            jaxls.SE3Var(jnp.arange(1, timesteps)),
-            jaxls.SE3Var(jnp.arange(0, timesteps - 1)),
-        ),
-        pk.costs.limit_constraint(
-            jax.tree.map(lambda x: x[None], robot),
-            var_joints,
-        ),
+        retargeting_cost(var_T_world_root, var_joints, target_keypoints),
+        pc_alignment_cost(var_T_world_root, var_joints, target_keypoints),
+        pk.costs.limit_constraint(robot, var_joints),
     ]
 
     solution = (
-        jaxls.LeastSquaresProblem(
-            costs=costs,
-            variables=[
-                var_joints,
-                var_Ts_world_root,
-                var_mano_joints_scale,
-                var_offset,
-            ],
-        )
+        jaxls.LeastSquaresProblem(costs=costs, variables=[var_joints, var_T_world_root])
         .analyze()
-        .solve()
+        .solve(
+            verbose=False,
+            linear_solver="dense_cholesky",
+            initial_vals=jaxls.VarValues.make(
+                [var_joints.with_value(prev_joints), var_T_world_root.with_value(prev_T_world_root)]
+            ),
+            termination=jaxls.TerminationConfig(max_iterations=10),
+        )
     )
-    transform = solution[var_Ts_world_root]
-    offset = solution[var_offset]
-    transform = jaxlie.SE3.from_translation(offset) @ transform
-    return transform, solution[var_joints]
+    return solution[var_T_world_root], solution[var_joints]
 
+
+def main():
+    asset_dir = Path(__file__).parent / "retarget_helpers" / "hand"
+    robot_urdf_path = asset_dir / "ruka" / "robot.urdf"
+
+    try:
+        urdf = load_ruka_urdf(robot_urdf_path)
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(
+            "Expected RUKA assets at `examples/retarget_helpers/hand/ruka`."
+        ) from exc
+
+    default_joint_cfg = jnp.zeros(len(urdf.actuated_joints))
+    robot = pk.Robot.from_urdf(urdf, default_joint_cfg=default_joint_cfg)
+
+    ruka_link_idx, mano_joint_idx = get_mapping_from_mano_to_ruka(robot)
+    mano_mask = create_conn_tree(robot, ruka_link_idx)
+
+    default_weights = RetargetingWeights(
+        local_alignment=10.0,
+        global_alignment=1.0,
+    )
+
+    # Viser visualizer.
+    server = viser.ViserServer()
+    base_frame = server.scene.add_frame("/base", show_axes=True, axes_length=0.05)
+    urdf_vis = ViserUrdf(server, urdf, root_node_name="/base")
+    urdf_vis.update_cfg(onp.zeros(len(urdf.actuated_joints)))
+
+    # Warm-start state — updated each frame so LM starts close to the solution.
+    prev_joints = jnp.zeros(robot.joints.num_actuated_joints)
+    prev_T_world_root = jaxlie.SE3.identity()
+
+    print("===== RUKA RETARGETING PROCESS =====")
+    print("==           Waiting...           ==")
+    while True:
+        keypoints = subscriber.recv(flags=zmq.NOBLOCK)
+        if keypoints is not None:
+            T_world_root, joints = solve_retargeting(
+                robot=robot,
+                target_keypoints=jnp.array(keypoints),
+                ruka_link_retarget_indices=ruka_link_idx,
+                mano_joint_retarget_indices=mano_joint_idx,
+                mano_mask=mano_mask,
+                weights=default_weights,
+                prev_joints=prev_joints,
+                prev_T_world_root=prev_T_world_root,
+            )
+
+            prev_joints = joints
+            prev_T_world_root = T_world_root
+
+            joints_np = onp.array(joints)
+            root_wxyz_xyz = onp.array(T_world_root.wxyz_xyz)
+            base_frame.wxyz = root_wxyz_xyz[:4]
+            base_frame.position = root_wxyz_xyz[4:]
+            urdf_vis.update_cfg(joints_np)
+
+            server.scene.add_point_cloud(
+                "/keypoints",
+                onp.array(keypoints).reshape(-1, 3),
+                colors=onp.full((21, 3), (0, 100, 255), dtype=onp.uint8),
+                point_size=0.004,
+            )
+
+            publisher.pub(data_array=joints_np, topic_name="ruka_r_joints")
 
 if __name__ == "__main__":
     main()

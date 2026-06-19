@@ -19,7 +19,7 @@ classifiers = [
 ]
 dependencies = [
     "tyro",
-    "jax>=0.4.0",
+    "jax[cuda12]>=0.4.0",
     "jaxlib",
     "jaxlie>=1.0.0",
     "jax_dataclasses>=1.0.0",
@@ -30,7 +30,7 @@ dependencies = [
     "yourdfpy",
     "trimesh",
     "viser",
-    "pyliblzfse",  # Need for viser.extras import in viser==0.2.23 
+    "pyliblzfse",  # Need for viser.extras import in viser==0.2.23
 ]
 
 [project.optional-dependencies]
@@ -68,4 +68,9 @@ ignore = [
     "PLR0912",  # Too many branches.
     "PLW0603",  # Globa statement updates are discouraged.
     "PLW2901",  # For loop variable overwritten.
+]
+
+[tool.uv]
+required-environments = [
+    "sys_platform == 'linux' and platform_machine == 'aarch64'"
 ]
