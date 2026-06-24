@@ -883,7 +883,7 @@
     <parent link="thumb___joint_1"/>
     <child link="thumb___joint_2"/>
     <axis xyz="0 0 1"/>
-    <limit effort="10" velocity="10" lower="-0.77" upper="0.7"/>
+    <limit effort="10" velocity="10" lower="-0.77" upper="1.57"/>
   </joint>
   <!-- Joint from backhand to thumb___joint_1 -->
   <joint name="thumb_cmc" type="revolute">
