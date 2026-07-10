@@ -31,6 +31,7 @@ dependencies = [
     "trimesh",
     "viser",
     "pyliblzfse",  # Need for viser.extras import in viser==0.2.23
+    "zmq>=0.0.0",
 ]
 
 [project.optional-dependencies]
@@ -73,4 +74,17 @@ ignore = [
 [tool.uv]
 required-environments = [
     "sys_platform == 'linux' and platform_machine == 'aarch64'"
+]
+
+[tool.uv.workspace]
+members = [
+    ".",
+]
+
+[tool.uv.sources]
+pyroki = { workspace = true }
+
+[dependency-groups]
+dev = [
+    "pyroki",
 ]
