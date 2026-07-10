@@ -280,8 +280,8 @@ def solve_retargeting(
 
 
 def main():
-    asset_dir = Path(__file__).parent / "retarget_helpers" / "hand"
-    robot_urdf_path = asset_dir / "ruka" / "robot.urdf"
+    asset_dir = Path(__file__).parent.parent / "examples" / "retarget_helpers" / "hand"
+    robot_urdf_path = asset_dir / "ruka" / "robot_mirrored.urdf"
 
     try:
         urdf = load_ruka_urdf(robot_urdf_path)
