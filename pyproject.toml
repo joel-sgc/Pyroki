@@ -31,6 +31,7 @@ dependencies = [
     "trimesh",
     "viser",
     "pyliblzfse",  # Need for viser.extras import in viser==0.2.23
+    "zmq>=0.0.0",
 ]
 
 [project.optional-dependencies]
