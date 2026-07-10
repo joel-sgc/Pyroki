@@ -1755,6 +1755,11 @@ dev = [
     { name = "scikit-sparse" },
 ]
 
+[package.dev-dependencies]
+dev = [
+    { name = "pyroki" },
+]
+
 [package.metadata]
 requires-dist = [
     { name = "jax", extras = ["cuda12"], specifier = ">=0.4.0" },
@@ -1778,6 +1783,9 @@ requires-dist = [
     { name = "zmq", specifier = ">=0.0.0" },
 ]
 provides-extras = ["dev"]
+
+[package.metadata.requires-dev]
+dev = [{ name = "pyroki", editable = "." }]
 
 [[package]]
 name = "pytest"

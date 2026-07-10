@@ -4,6 +4,8 @@ Variant of 09_hand_retargeting.py for the RUKA-v2 hand assets copied to
 `examples/retarget_helpers/hand/ruka`.
 """
 
+import logging
+import time
 from pathlib import Path
 from typing import Tuple, TypedDict
 
@@ -23,8 +25,17 @@ from zmq_utils import ZMQSubscriber, ZMQPublisher
 
 from retarget_helpers._utils import create_conn_tree
 
-subscriber = ZMQSubscriber(host="localhost", port=5052, topic="ruka_r_keypoints")
-publisher = ZMQPublisher(host="localhost", port=5053)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
+logger = logging.getLogger("ruka_retargeter")
+
+# Makes JAX log a line every time it actually compiles a jitted function
+# (as opposed to hitting the compilation cache), including the argument
+# shapes/dtypes that triggered it. If `solve_retargeting` is recompiling on
+# every frame instead of once, this is what will show it.
+jax.config.update("jax_log_compiles", True)
+
+subscriber = ZMQSubscriber(host="0.0.0.0", port=5052, topic="ruka_r_keypoints")
+publisher = ZMQPublisher(host="0.0.0.0", port=5053)
 
 MANO_TO_RUKA_MAPPING = {
     # Wrist / palm.
@@ -191,6 +202,7 @@ def solve_retargeting(
     ruka_link_retarget_indices: jnp.ndarray,
     mano_joint_retarget_indices: jnp.ndarray,
     mano_mask: jnp.ndarray,
+    scale: jnp.ndarray,
     weights: RetargetingWeights,
     prev_joints: jnp.ndarray,
     prev_T_world_root: jaxlie.SE3,
@@ -218,7 +230,7 @@ def solve_retargeting(
         delta_robot = robot_pos[:, None] - robot_pos[None, :]
 
         residual_position_delta = (
-            (delta_mano - delta_robot)
+            (delta_mano - delta_robot * scale[..., None])
             * (1 - jnp.eye(delta_mano.shape[0])[..., None])
             * mano_mask[..., None]
         )
@@ -296,6 +308,23 @@ def main():
     ruka_link_idx, mano_joint_idx = get_mapping_from_mano_to_ruka(robot)
     mano_mask = create_conn_tree(robot, ruka_link_idx)
 
+    # Thumb diagnostics — indices into the *actuated joint* config vector
+    # (`joints_np` below), used to log whether the thumb is actually reaching
+    # its mechanical limits or stalling well short of them.
+    thumb_joint_names = ["thumb_cmc", "thumb_mcp", "thumb_ip"]
+    thumb_actuated_idx = [
+        robot.joints.actuated_names.index(name) for name in thumb_joint_names
+    ]
+    for name, idx in zip(thumb_joint_names, thumb_actuated_idx):
+        lower = float(robot.joints.lower_limits[idx])
+        upper = float(robot.joints.upper_limits[idx])
+        logger.info(f"joint limit: {name} (idx {idx}) = [{lower:.3f}, {upper:.3f}] rad")
+
+    # Index into the *retargeted MANO/RUKA* pair ordering (0=wrist,
+    # 1..4=thumb joint_1/2/3/tip) — used to inspect the calibrated scale
+    # submatrix for the thumb chain specifically.
+    thumb_retarget_idx = [0, 1, 2, 3, 4]
+
     # Viser visualizer.
     server = viser.ViserServer()
     base_frame = server.scene.add_frame("/base", show_axes=True, axes_length=0.05)
@@ -314,13 +343,17 @@ def main():
     CALIB_FRAMES = 30
     calib_buf = []
     print("===== RUKA RETARGETING PROCESS =====")
-    print(f"== Calibrating scale ({CALIB_FRAMES} frames) — move your hand around ==")
+    print(
+        f"== Calibrating scale ({CALIB_FRAMES} frames) — move your hand around, "
+        "including opposing your thumb across your palm =="
+    )
     while len(calib_buf) < CALIB_FRAMES:
         kp = subscriber.recv(flags=zmq.NOBLOCK)
         if kp is not None:
             calib_buf.append(kp)
             print(f"\r  [{len(calib_buf)}/{CALIB_FRAMES}]", end="", flush=True)
     print("\n== Solving for MANO→RUKA scale... ==")
+    t0 = time.perf_counter()
     scale = calibrate_scale(
         robot=robot,
         target_keypoints=jnp.array(jnp.stack(calib_buf)),
@@ -328,29 +361,57 @@ def main():
         mano_joint_retarget_indices=mano_joint_idx,
         mano_mask=mano_mask,
     )
+    scale.block_until_ready()
+    logger.info(f"calibrate_scale: compile + solve took {time.perf_counter() - t0:.2f}s")
+    thumb_scale_submatrix = onp.array(scale)[onp.ix_(thumb_retarget_idx, thumb_retarget_idx)]
+    logger.info(
+        "calibrated scale, wrist/thumb chain (rows/cols = wrist, thumb_1, thumb_2, "
+        f"thumb_3, thumb_tip):\n{thumb_scale_submatrix}"
+    )
     print("== Calibration done — entering fast mode ==")
 
     # Warm-start state — updated each frame so LM starts close to the solution.
     prev_joints = jnp.zeros(robot.joints.num_actuated_joints)
     prev_T_world_root = jaxlie.SE3.identity()
 
+    frame_idx = 0
     while True:
         keypoints = subscriber.recv(flags=zmq.NOBLOCK)
         if keypoints is not None:
+            keypoints = jnp.array(keypoints)
+            if frame_idx == 0:
+                logger.info(
+                    f"first frame: keypoints shape={keypoints.shape} dtype={keypoints.dtype}"
+                )
+
             weights = RetargetingWeights(
                 local_alignment=jnp.array(gui_local.value),
                 global_alignment=jnp.array(gui_global.value),
             )
+
+            t0 = time.perf_counter()
             T_world_root, joints = solve_retargeting(
                 robot=robot,
-                target_keypoints=jnp.array(keypoints),
+                target_keypoints=keypoints,
                 ruka_link_retarget_indices=ruka_link_idx,
                 mano_joint_retarget_indices=mano_joint_idx,
                 mano_mask=mano_mask,
+                scale=scale,
                 weights=weights,
                 prev_joints=prev_joints,
                 prev_T_world_root=prev_T_world_root,
             )
+            joints.block_until_ready()
+            elapsed = time.perf_counter() - t0
+            # First frame is expected to be slow (JIT compile). Anything else
+            # slow afterwards means it's recompiling instead of hitting cache.
+            if frame_idx == 0:
+                logger.info(f"frame {frame_idx}: solve_retargeting compile + solve took {elapsed:.2f}s")
+            elif elapsed > 0.05:
+                logger.warning(
+                    f"frame {frame_idx}: solve_retargeting took {elapsed * 1000:.1f}ms (unexpectedly slow — possible recompile)"
+                )
+            frame_idx += 1
 
             prev_joints = joints
             prev_T_world_root = T_world_root
@@ -361,6 +422,13 @@ def main():
             base_frame.position = root_wxyz_xyz[4:]
             urdf_vis.update_cfg(joints_np)
 
+            if frame_idx % 30 == 0:
+                thumb_state = ", ".join(
+                    f"{name}={joints_np[idx]:+.3f} (limits [{float(robot.joints.lower_limits[idx]):+.2f}, {float(robot.joints.upper_limits[idx]):+.2f}])"
+                    for name, idx in zip(thumb_joint_names, thumb_actuated_idx)
+                )
+                logger.info(f"frame {frame_idx}: {thumb_state}")
+
             server.scene.add_point_cloud(
                 "/keypoints",
                 onp.array(keypoints).reshape(-1, 3),
@@ -368,6 +436,7 @@ def main():
                 point_size=0.004,
             )
 
+            print(joints_np)
             publisher.pub(data_array=joints_np, topic_name="ruka_r_joints")
 
 if __name__ == "__main__":

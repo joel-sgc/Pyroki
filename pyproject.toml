@@ -75,3 +75,16 @@ ignore = [
 required-environments = [
     "sys_platform == 'linux' and platform_machine == 'aarch64'"
 ]
+
+[tool.uv.workspace]
+members = [
+    ".",
+]
+
+[tool.uv.sources]
+pyroki = { workspace = true }
+
+[dependency-groups]
+dev = [
+    "pyroki",
+]
